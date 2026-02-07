@@ -1,0 +1,410 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'MLOps Fashion-MNIST Demo - Complete Infrastructure with GPU Training'
+
+# =============================================================================
+# パラメータ
+# =============================================================================
+Parameters:
+  BucketName:
+    Type: String
+    Description: S3 bucket name for datasets and models
+  
+  AccuracyThreshold:
+    Type: String
+    Default: "0.85"
+    Description: Minimum accuracy threshold for deployment (0.0 - 1.0)
+  
+  TrainingInstanceType:
+    Type: String
+    Default: ml.g4dn.xlarge
+    AllowedValues:
+      - ml.m5.large      # CPU
+      - ml.g4dn.xlarge   # GPU (T4)
+      - ml.g4dn.2xlarge  # GPU (T4, more memory)
+      - ml.g5.xlarge     # GPU (A10G)
+    Description: SageMaker training instance type
+
+# =============================================================================
+# リソース定義
+# =============================================================================
+Resources:
+
+  # ---------------------------------------------------------------------------
+  # IAM Role: SageMaker実行ロール
+  # ---------------------------------------------------------------------------
+  SageMakerExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-sagemaker-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: sagemaker.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSageMakerFullAccess
+      Policies:
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub 'arn:aws:s3:::${BucketName}'
+                  - !Sub 'arn:aws:s3:::${BucketName}/*'
+
+  # ---------------------------------------------------------------------------
+  # IAM Role: Lambda実行ロール
+  # ---------------------------------------------------------------------------
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3AndSNSAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource:
+                  - !Sub 'arn:aws:s3:::${BucketName}/*'
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource:
+                  - !Ref NotificationTopic
+
+  # ---------------------------------------------------------------------------
+  # IAM Role: Step Functions実行ロール
+  # ---------------------------------------------------------------------------
+  StepFunctionsExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-stepfunctions-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: StepFunctionsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sagemaker:CreateTrainingJob
+                  - sagemaker:DescribeTrainingJob
+                  - sagemaker:StopTrainingJob
+                  - sagemaker:CreateModel
+                  - sagemaker:CreateEndpointConfig
+                  - sagemaker:CreateEndpoint
+                  - sagemaker:UpdateEndpoint
+                  - sagemaker:DescribeEndpoint
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource:
+                  - !GetAtt AccuracyCheckerFunction.Arn
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource:
+                  - !Ref NotificationTopic
+              - Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource:
+                  - !GetAtt SageMakerExecutionRole.Arn
+              - Effect: Allow
+                Action:
+                  - events:PutTargets
+                  - events:PutRule
+                  - events:DescribeRule
+                Resource: '*'
+
+  # ---------------------------------------------------------------------------
+  # IAM Role: EventBridge実行ロール
+  # ---------------------------------------------------------------------------
+  EventBridgeExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-eventbridge-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: StartStepFunctions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - states:StartExecution
+                Resource:
+                  - !Ref MLOpsPipeline
+
+  # ---------------------------------------------------------------------------
+  # SNS Topic: 通知用
+  # ---------------------------------------------------------------------------
+  NotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${AWS::StackName}-notifications'
+      DisplayName: MLOps Notifications
+
+  # ---------------------------------------------------------------------------
+  # Lambda Function: 精度評価
+  # ---------------------------------------------------------------------------
+  AccuracyCheckerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-accuracy-checker'
+      Description: Evaluate model accuracy and make deployment decision
+      Runtime: python3.11
+      Handler: accuracy_checker.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 120
+      MemorySize: 512
+      Code:
+        S3Bucket: !Ref BucketName
+        S3Key: lambda/accuracy_checker.zip
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref BucketName
+          THRESHOLD: !Ref AccuracyThreshold
+          SNS_TOPIC_ARN: !Ref NotificationTopic
+
+  # ---------------------------------------------------------------------------
+  # Step Functions: MLOpsパイプライン
+  # ---------------------------------------------------------------------------
+  MLOpsPipeline:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub '${AWS::StackName}-pipeline'
+      RoleArn: !GetAtt StepFunctionsExecutionRole.Arn
+      DefinitionString: !Sub |
+        {
+          "Comment": "MLOps Fashion-MNIST Training Pipeline",
+          "StartAt": "GenerateJobId",
+          "States": {
+            "GenerateJobId": {
+              "Type": "Pass",
+              "Comment": "Generate unique training job name",
+              "Parameters": {
+                "job_id.$": "States.Format('fashion-{}', States.ArrayGetItem(States.StringSplit($$.Execution.StartTime, ':'), 0))"
+              },
+              "ResultPath": "$.job",
+              "Next": "StartTrainingJob"
+            },
+            
+            "StartTrainingJob": {
+              "Type": "Task",
+              "Comment": "Start SageMaker training job with GPU",
+              "Resource": "arn:aws:states:::sagemaker:createTrainingJob.sync",
+              "Parameters": {
+                "TrainingJobName.$": "$.job.job_id",
+                "AlgorithmSpecification": {
+                  "TrainingImage": "763104351884.dkr.ecr.${AWS::Region}.amazonaws.com/pytorch-training:2.0.1-gpu-py310-cu118-ubuntu20.04-sagemaker",
+                  "TrainingInputMode": "File"
+                },
+                "RoleArn": "${SageMakerExecutionRole.Arn}",
+                "InputDataConfig": [
+                  {
+                    "ChannelName": "training",
+                    "DataSource": {
+                      "S3DataSource": {
+                        "S3DataType": "S3Prefix",
+                        "S3Uri": "s3://${BucketName}/training/",
+                        "S3DataDistributionType": "FullyReplicated"
+                      }
+                    }
+                  },
+                  {
+                    "ChannelName": "testing",
+                    "DataSource": {
+                      "S3DataSource": {
+                        "S3DataType": "S3Prefix",
+                        "S3Uri": "s3://${BucketName}/testing/",
+                        "S3DataDistributionType": "FullyReplicated"
+                      }
+                    }
+                  }
+                ],
+                "OutputDataConfig": {
+                  "S3OutputPath": "s3://${BucketName}/models/"
+                },
+                "ResourceConfig": {
+                  "InstanceCount": 1,
+                  "InstanceType": "${TrainingInstanceType}",
+                  "VolumeSizeInGB": 50
+                },
+                "StoppingCondition": {
+                  "MaxRuntimeInSeconds": 3600
+                },
+                "HyperParameters": {
+                  "sagemaker_program": "\"train.py\"",
+                  "sagemaker_submit_directory": "\"s3://${BucketName}/code/sourcedir.tar.gz\"",
+                  "epochs": "\"5\"",
+                  "batch-size": "\"256\"",
+                  "lr": "\"0.001\""
+                }
+              },
+              "ResultPath": "$.training",
+              "Next": "EvaluateModelAccuracy",
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "ResultPath": "$.error",
+                  "Next": "NotifyTrainingFailure"
+                }
+              ]
+            },
+            
+            "EvaluateModelAccuracy": {
+              "Type": "Task",
+              "Comment": "Evaluate model accuracy using Lambda",
+              "Resource": "${AccuracyCheckerFunction.Arn}",
+              "Parameters": {
+                "training_job_name.$": "$.job.job_id",
+                "model_artifact_s3_uri.$": "$.training.ModelArtifacts.S3ModelArtifacts"
+              },
+              "ResultPath": "$.evaluation",
+              "Next": "DeploymentDecision"
+            },
+            
+            "DeploymentDecision": {
+              "Type": "Choice",
+              "Comment": "Check if model meets accuracy threshold",
+              "Choices": [
+                {
+                  "Variable": "$.evaluation.deploy_decision",
+                  "StringEquals": "APPROVED",
+                  "Next": "CreateModel"
+                }
+              ],
+              "Default": "DeploymentSkipped"
+            },
+            
+            "CreateModel": {
+              "Type": "Task",
+              "Comment": "Register model in SageMaker",
+              "Resource": "arn:aws:states:::sagemaker:createModel",
+              "Parameters": {
+                "ModelName.$": "States.Format('model-{}', $.job.job_id)",
+                "PrimaryContainer": {
+                  "Image": "763104351884.dkr.ecr.${AWS::Region}.amazonaws.com/pytorch-inference:2.0.1-gpu-py310-cu118-ubuntu20.04-sagemaker",
+                  "ModelDataUrl.$": "$.evaluation.model_artifact_uri"
+                },
+                "ExecutionRoleArn": "${SageMakerExecutionRole.Arn}"
+              },
+              "ResultPath": "$.model",
+              "Next": "DeploymentSuccess"
+            },
+            
+            "DeploymentSuccess": {
+              "Type": "Succeed",
+              "Comment": "Model deployed successfully"
+            },
+            
+            "DeploymentSkipped": {
+              "Type": "Succeed",
+              "Comment": "Deployment skipped - accuracy below threshold"
+            },
+            
+            "NotifyTrainingFailure": {
+              "Type": "Task",
+              "Comment": "Send notification about training failure",
+              "Resource": "arn:aws:states:::sns:publish",
+              "Parameters": {
+                "TopicArn": "${NotificationTopic}",
+                "Subject": "❌ MLOps: Training Failed",
+                "Message.$": "States.Format('Training job {} failed. Error: {}', $.job.job_id, $.error)"
+              },
+              "Next": "PipelineFailed"
+            },
+            
+            "PipelineFailed": {
+              "Type": "Fail",
+              "Comment": "Pipeline failed",
+              "Error": "TrainingJobFailed",
+              "Cause": "SageMaker training job failed"
+            }
+          }
+        }
+
+  # ---------------------------------------------------------------------------
+  # EventBridge Rule: 毎日0時(JST)に実行
+  # ---------------------------------------------------------------------------
+  DailyTrainingSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${AWS::StackName}-daily-trigger'
+      Description: 'Trigger MLOps pipeline daily at 00:00 JST (15:00 UTC)'
+      ScheduleExpression: 'cron(0 15 * * ? *)'
+      State: ENABLED
+      Targets:
+        - Id: StepFunctionsTarget
+          Arn: !Ref MLOpsPipeline
+          RoleArn: !GetAtt EventBridgeExecutionRole.Arn
+          Input: '{"trigger": "scheduled", "schedule": "daily"}'
+
+# =============================================================================
+# 出力
+# =============================================================================
+Outputs:
+  PipelineArn:
+    Description: Step Functions State Machine ARN
+    Value: !Ref MLOpsPipeline
+    Export:
+      Name: !Sub '${AWS::StackName}-PipelineArn'
+  
+  BucketName:
+    Description: S3 Bucket for datasets and models
+    Value: !Ref BucketName
+    Export:
+      Name: !Sub '${AWS::StackName}-BucketName'
+  
+  SNSTopicArn:
+    Description: SNS Topic for notifications
+    Value: !Ref NotificationTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-SNSTopicArn'
+  
+  LambdaFunctionArn:
+    Description: Accuracy Checker Lambda Function ARN
+    Value: !GetAtt AccuracyCheckerFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaArn'
+  
+  SageMakerRoleArn:
+    Description: SageMaker Execution Role ARN
+    Value: !GetAtt SageMakerExecutionRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-SageMakerRoleArn'
