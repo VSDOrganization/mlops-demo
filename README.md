@@ -7,7 +7,7 @@ AWS SageMakerを使用したMLOpsパイプラインのデモプロジェクト�
 - **データセット**: Fashion-MNIST（10クラスのファッションアイテム画像）
 - **モデル**: シンプルなCNN（PyTorch）
 - **インフラ**: AWS SageMaker + Step Functions + EventBridge
-- **自動実行**: 毎日0:00 JSTに学習→評価→デプロイ
+- **自動実行**: 毎日0:00 JSTに学習→評価
 
 ## アーキテクチャ
 
@@ -20,34 +20,34 @@ SageMaker Training (GPU学習: ml.g4dn.xlarge)
     ↓
 Lambda (精度評価: 85%以上?)
     ↓
-SageMaker Endpoint (デプロイ) or 通知 (精度未達)
+    ├─ YES → デプロイ承認
+    └─ NO → SNS通知 (精度未達)
 ```
 
 ## ディレクトリ構成
 
 ```
-mlops-fashion-mnist-demo/
+mlops-demo/
 ├── README.md
-├── LICENSE
-├── setup.sh                    # ワンクリックセットアップ
-├── cleanup.sh                  # リソース削除
+├── setup.sh                      # セットアップスクリプト
+├── cleanup.sh                    # リソース削除
 ├── .gitignore
 │
 ├── src/
 │   ├── data_preparation/
-│   │   └── prepare_dataset.py  # データセット準備
+│   │   └── prepare_dataset.py    # データセット準備
 │   ├── training/
-│   │   ├── train.py            # 学習エントリーポイント
-│   │   ├── model.py            # モデル定義
-│   │   ├── trainer.py          # 学習ロジック
-│   │   ├── dataset.py          # データローダー
+│   │   ├── train.py              # 学習エントリーポイント
+│   │   ├── model.py              # モデル定義
+│   │   ├── trainer.py            # 学習ロジック
+│   │   ├── dataset.py            # データローダー
 │   │   └── requirements.txt
 │   └── lambda/
-│       └── accuracy_checker.py # 精度評価Lambda
+│       └── accuracy_checker.py   # 精度評価Lambda
 │
 └── infrastructure/
     └── cloudformation/
-        └── mlops-stack.yaml    # AWSリソース定義
+        └── mlops-stack.yaml      # インフラ定義
 ```
 
 ## クイックスタート
@@ -55,14 +55,13 @@ mlops-fashion-mnist-demo/
 ### 前提条件
 
 - AWSアカウント
-- AWS CLI設定済み（`aws configure`）
 
 ### セットアップ（AWS CloudShellで実行）
 
 ```bash
 # 1. リポジトリをクローン
-git clone https://github.com/your-username/mlops-fashion-mnist-demo.git
-cd mlops-fashion-mnist-demo
+git clone https://github.com/your-username/mlops-demo.git
+cd mlops-demo
 
 # 2. セットアップ実行（約5分）
 chmod +x setup.sh

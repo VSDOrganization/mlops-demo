@@ -145,8 +145,9 @@ cd "${SCRIPT_DIR}/src/lambda"
 zip -j /tmp/accuracy_checker.zip accuracy_checker.py
 aws s3 cp /tmp/accuracy_checker.zip "s3://${BUCKET_NAME}/lambda/accuracy_checker.zip"
 rm /tmp/accuracy_checker.zip
+print_info "  ✅ accuracy_checker.zip"
+
 cd "${SCRIPT_DIR}"
-print_info "Lambda関数をアップロード: s3://${BUCKET_NAME}/lambda/accuracy_checker.zip"
 
 # -----------------------------------------------------------------------------
 # CloudFormationスタックのデプロイ

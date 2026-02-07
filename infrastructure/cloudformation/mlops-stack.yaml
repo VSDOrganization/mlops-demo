@@ -117,11 +117,8 @@ Resources:
                   - sagemaker:CreateTrainingJob
                   - sagemaker:DescribeTrainingJob
                   - sagemaker:StopTrainingJob
-                  - sagemaker:CreateModel
-                  - sagemaker:CreateEndpointConfig
-                  - sagemaker:CreateEndpoint
-                  - sagemaker:UpdateEndpoint
-                  - sagemaker:DescribeEndpoint
+                  - sagemaker:AddTags
+                  - sagemaker:ListTags
                 Resource: '*'
               - Effect: Allow
                 Action:
@@ -306,27 +303,13 @@ Resources:
                 {
                   "Variable": "$.evaluation.deploy_decision",
                   "StringEquals": "APPROVED",
-                  "Next": "CreateModel"
+                  "Next": "DeploymentSuccess"
                 }
               ],
               "Default": "DeploymentSkipped"
             },
             
-            "CreateModel": {
-              "Type": "Task",
-              "Comment": "Register model in SageMaker",
-              "Resource": "arn:aws:states:::sagemaker:createModel",
-              "Parameters": {
-                "ModelName.$": "States.Format('model-{}', $.job.job_id)",
-                "PrimaryContainer": {
-                  "Image": "763104351884.dkr.ecr.${AWS::Region}.amazonaws.com/pytorch-inference:2.0.1-gpu-py310-cu118-ubuntu20.04-sagemaker",
-                  "ModelDataUrl.$": "$.evaluation.model_artifact_uri"
-                },
-                "ExecutionRoleArn": "${SageMakerExecutionRole.Arn}"
-              },
-              "ResultPath": "$.model",
-              "Next": "DeploymentSuccess"
-            },
+
             
             "DeploymentSuccess": {
               "Type": "Succeed",
